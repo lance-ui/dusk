@@ -1,0 +1,9 @@
+# scenefx: wlroots' scene graph with rounded corners, shadows and blur
+# (the library behind SwayFX). Fetched and built automatically by meson.
+[wrap-git]
+url = https://github.com/wlrfx/scenefx.git
+revision = 0.5
+depth = 1
+
+[provide]
+scenefx-0.5 = scenefx

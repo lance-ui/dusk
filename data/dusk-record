@@ -1,0 +1,76 @@
+#!/bin/bash
+# dusk-record: records the screen (or part of it) for Dusk's screenshot tool,
+# with wf-recorder. Picks a video encoder that works on this computer: the
+# graphics chip's own (VA-API) when it can, else x264, OpenH264 or VP9.
+#
+#   dusk-record --file BASE [--output NAME] [--geometry "X,Y WxH"] [--fps 60]
+#               [--quality high|standard] [--audio none|system|mic]
+#
+# BASE is the path without an extension (.mp4 or .webm is added). Prints
+# "FILE:<path>" once recording has started; stops cleanly on SIGINT/SIGTERM.
+set -u
+base="" output="" geometry="" fps=60 quality=high audio=none
+while (($#)); do
+	case "$1" in
+	--file) base="$2"; shift ;;
+	--output) output="$2"; shift ;;
+	--geometry) geometry="$2"; shift ;;
+	--fps) fps="$2"; shift ;;
+	--quality) quality="$2"; shift ;;
+	--audio) audio="$2"; shift ;;
+	esac
+	shift
+done
+command -v wf-recorder >/dev/null || { echo "ERROR:wf-recorder isn't installed"; exit 3; }
+[[ -n "$base" ]] || exit 2
+mkdir -p "$(dirname "$base")"
+
+common=(-y -r "$fps")
+[[ -n "$output" && -z "$geometry" ]] && common+=(-o "$output")   # an area finds its own screen
+[[ -n "$geometry" ]] && common+=(-g "$geometry")
+case "$audio" in
+system)
+	sink=$(pactl get-default-sink 2>/dev/null)
+	[[ -n "$sink" ]] && common+=("--audio=$sink.monitor") ;;
+mic)
+	src=$(pactl get-default-source 2>/dev/null)
+	[[ -n "$src" ]] && common+=("--audio=$src") || common+=(--audio) ;;
+esac
+
+if [[ "$quality" == high ]]; then crf=20 vp9crf=28 rate=16M; else crf=26 vp9crf=36 rate=8M; fi
+render=$(ls /dev/dri/renderD* 2>/dev/null | head -n 1)
+
+pid="" stopping=""
+stop() { stopping=1; [[ -n "$pid" ]] && kill -TERM "$pid" 2>/dev/null; }
+trap stop INT TERM
+
+# Starts one encoder; true if it's still recording a moment later.
+try() {
+	local ext="$1"; shift
+	[[ -n "$stopping" ]] && return 1   # stopped before it got going
+	file="$base.$ext"
+	rm -f "$file"
+	wf-recorder "${common[@]}" -f "$file" "$@" >/dev/null 2>"$base.log" &
+	pid=$!
+	for _ in 1 2 3 4 5 6; do
+		sleep 0.25
+		kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; pid=""; rm -f "$file"; return 1; }
+	done
+	return 0
+}
+
+if { [[ -n "$render" ]] && try mp4 -c h264_vaapi -d "$render" -p qp="$crf"; } ||
+	try mp4 -c libx264 -p preset=veryfast -p crf="$crf" -x yuv420p ||
+	try mp4 -c libopenh264 -p b="$rate" -x yuv420p ||
+	try webm -c libvpx-vp9 -p deadline=realtime -p cpu-used=8 -p row-mt=1 -p crf="$vp9crf" -p b=0 -C libopus ||
+	try webm -c libvpx -p deadline=realtime -p cpu-used=8 -p crf="$vp9crf" -p b="$rate" -C libopus; then
+	rm -f "$base.log"
+	echo "FILE:$file"
+	# Until stopped (the trap passes the stop on), then until it has finished writing.
+	while kill -0 "$pid" 2>/dev/null; do wait "$pid"; done
+	exit 0
+fi
+[[ -n "$stopping" ]] && { rm -f "$base.log"; exit 5; }
+echo "ERROR:$(tail -n 3 "$base.log" 2>/dev/null | tr '\n' ' ')"
+rm -f "$base.log"
+exit 4

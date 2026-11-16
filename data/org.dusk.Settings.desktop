@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dusk Settings
+Comment=Appearance, windows, panels, control centre, notifications, input and displays
+Exec=dusk-settings
+Icon=org.dusk.Settings
+Categories=Settings;DesktopSettings;Qt;
+Keywords=wallpaper;background;accent;colour;color;theme;dark;light;panel;taskbar;dock;control;centre;center;tiles;notifications;animation;osd;volume;brightness;keyboard;layout;mouse;touchpad;display;scale;phone;tablet;vnc;screenshot;tray;history;
+OnlyShowIn=Dusk;

@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: build (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cc == 'gcc' && 'g++' || 'clang++' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson ninja-build git pkg-config \
+            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libpixman-1-dev libdrm-dev libgbm-dev libinput-dev libseat-dev \
+            libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev \
+            libsystemd-dev libpam0g-dev \
+            libxcb1-dev libxcb-icccm4-dev libegl-dev libgl-dev
+
+      # wlroots 0.20 is newer than what most distros ship: build it from
+      # source when pkg-config cannot find it.
+      - name: Build wlroots 0.20 if the distro does not ship it
+        run: |
+          if ! pkg-config --exists 'wlroots-0.20 >= 0.20.0'; then
+            git clone --depth 1 --branch 0.20.0 \
+              https://gitlab.freedesktop.org/wlroots/wlroots.git /tmp/wlroots
+            meson setup /tmp/wlroots/build /tmp/wlroots -Dexamples=false \
+              --prefix=/tmp/wlroots-install
+            ninja -C /tmp/wlroots/build
+            ninja -C /tmp/wlroots/build install
+            echo "PKG_CONFIG_PATH=/tmp/wlroots-install/lib/x86_64-linux-gnu/pkgconfig:/tmp/wlroots-install/lib/pkgconfig" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure
+        run: meson setup build
+
+      - name: Build
+        run: ninja -C build
+
+  sanitizers:
+    name: build with ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson ninja-build git pkg-config \
+            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libpixman-1-dev libdrm-dev libgbm-dev libinput-dev libseat-dev \
+            libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev \
+            libsystemd-dev libpam0g-dev \
+            libxcb1-dev libxcb-icccm4-dev libegl-dev libgl-dev
+
+      - name: Build wlroots 0.20 if the distro does not ship it
+        run: |
+          if ! pkg-config --exists 'wlroots-0.20 >= 0.20.0'; then
+            git clone --depth 1 --branch 0.20.0 \
+              https://gitlab.freedesktop.org/wlroots/wlroots.git /tmp/wlroots
+            meson setup /tmp/wlroots/build /tmp/wlroots -Dexamples=false \
+              --prefix=/tmp/wlroots-install
+            ninja -C /tmp/wlroots/build
+            ninja -C /tmp/wlroots/build install
+            echo "PKG_CONFIG_PATH=/tmp/wlroots-install/lib/x86_64-linux-gnu/pkgconfig:/tmp/wlroots-install/lib/pkgconfig" >> "$GITHUB_ENV"
+          fi
+
+      # The sanitizer build is the real gate: it catches the exit-time
+      # use-after-free class of bug and undefined behaviour like a bad
+      # std::clamp range on every commit, with no display hardware needed.
+      - name: Configure with sanitizers
+        run: meson setup build-san -Db_sanitize=address,undefined -Db_lto=false
+
+      - name: Build
+        run: ninja -C build-san

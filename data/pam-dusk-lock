@@ -1,0 +1,4 @@
+#%PAM-1.0
+# Dusk's lock screen: the same password check as logging in.
+auth       include      login
+account    include      login

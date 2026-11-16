@@ -1,0 +1,255 @@
+#!/bin/sh
+# Shows why apps might not follow Dusk (dark mode, saved passwords, admin prompts).
+# Run it in a terminal inside Dusk and send the output if something is wrong.
+have() { command -v "$1" >/dev/null 2>&1; }
+ok() { printf '  ok    %s\n' "$*"; }
+bad() { printf '  !!    %s\n' "$*"; }
+
+echo "== Session"
+echo "  XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP  ADW_DISABLE_PORTAL=${ADW_DISABLE_PORTAL:-unset}  QT_QPA_PLATFORMTHEME=${QT_QPA_PLATFORMTHEME:-unset}"
+
+echo "== Light / dark"
+for k in color-scheme gtk-theme accent-color icon-theme; do
+  echo "  $k: $(gsettings get org.gnome.desktop.interface $k 2>/dev/null)"
+done
+if have gdbus; then
+  v="$(gdbus call --session --dest org.freedesktop.portal.Desktop --object-path /org/freedesktop/portal/desktop \
+       --method org.freedesktop.portal.Settings.ReadOne org.freedesktop.appearance color-scheme 2>&1)"
+  case "$v" in
+    *"uint32 1"*) ok "portal says dark" ;;
+    *"uint32 2"*) ok "portal says light" ;;
+    *"uint32 0"*) bad "portal says 'no preference' (Flatpak GNOME apps will be light)" ;;
+    *) bad "portal not answering: $v" ;;
+  esac
+fi
+systemctl --user is-active graphical-session.target >/dev/null 2>&1 && ok "graphical session started (portals can run)" \
+  || bad "graphical-session.target not active (portals won't start; needs dusk-session.target)"
+if ! systemctl --user is-active xdg-desktop-portal.service >/dev/null 2>&1; then
+  echo "  portal service log:"
+  journalctl --user -u xdg-desktop-portal.service -n 5 --no-pager 2>/dev/null | sed 's/^/      /'
+fi
+[ -f /usr/share/xdg-desktop-portal/dusk-portals.conf ] && ok "dusk-portals.conf installed" || bad "dusk-portals.conf missing (run ./build.sh install)"
+rpm -q xdg-desktop-portal-gtk >/dev/null 2>&1 && ok "xdg-desktop-portal-gtk installed" || bad "xdg-desktop-portal-gtk not installed"
+have dusk-apply-theme && ok "dusk-apply-theme installed" || bad "dusk-apply-theme missing"
+
+echo "== Accent in GNOME apps"
+css="${XDG_CONFIG_HOME:-$HOME/.config}/gtk-4.0/gtk.css"
+if grep -q "dusk-start" "$css" 2>/dev/null; then
+  got="$(sed -n 's/^@define-color accent_bg_color \(.*\);/\1/p' "$css" | head -n 1)"
+  case "$got" in
+    \#??????) ok "exact accent in gtk-4.0/gtk.css: $got" ;;
+    *) bad "the accent in gtk-4.0/gtk.css is empty or broken ('$got'): change the accent once in Dusk Settings, then restart GNOME apps" ;;
+  esac
+else
+  bad "no Dusk block in $css (change the accent once in Dusk Settings)"
+fi
+for app in gnome-software nautilus; do
+  pgrep -u "$(id -u)" -f "$app --gapplication-service" >/dev/null 2>&1 && \
+    echo "  note  $app keeps running in the background: quit it (killall $app) to see a new accent"
+done
+
+echo "== Saved passwords (keyring)"
+if [ -x /usr/libexec/oo7-daemon ]; then
+  pgrep -u "$(id -u)" -f oo7-daemon >/dev/null && ok "oo7-daemon running (Fedora 45's keyring)" || bad "oo7-daemon not running"
+  grep -qs pam_oo7 /etc/pam.d/gdm-password /etc/pam.d/password-auth /etc/pam.d/postlogin && ok "login screen unlocks oo7 (PAM)" \
+    || bad "no pam_oo7 at login: install pam_oo7 (sudo dnf install pam_oo7)"
+  pgrep -u "$(id -u)" -x gnome-keyring-d >/dev/null && bad "gnome-keyring-daemon also running (it gets in oo7's way)"
+else
+pgrep -u "$(id -u)" -x gnome-keyring-d >/dev/null && ok "gnome-keyring-daemon running" || bad "gnome-keyring-daemon not running"
+fi
+if have gdbus; then
+  l="$(gdbus call --session --dest org.freedesktop.secrets --object-path /org/freedesktop/secrets/collection/login \
+       --method org.freedesktop.DBus.Properties.Get org.freedesktop.Secret.Collection Locked 2>&1)"
+  case "$l" in
+    *false*) ok "login keyring unlocked" ;;
+    *true*)  bad "login keyring locked (its password may differ from your login password)" ;;
+    *)       bad "no login keyring: $l" ;;
+  esac
+fi
+grep -qs pam_gnome_keyring /etc/pam.d/gdm-password && ok "login screen unlocks the keyring (PAM)" || bad "gdm-password has no pam_gnome_keyring"
+K="$HOME/.local/share/keyrings"
+echo "  keyrings: $(ls "$K" 2>/dev/null | tr '\n' ' ')  default: $(cat "$K/default" 2>/dev/null)"
+
+echo "== Admin password prompt (polkit)"
+found=""
+for a in /usr/libexec/polkit-gnome-authentication-agent-1 /usr/libexec/polkit-mate-authentication-agent-1 \
+         /usr/libexec/hyprpolkitagent /usr/libexec/kf6/polkit-kde-authentication-agent-1 /usr/bin/lxqt-policykit-agent; do
+  [ -x "$a" ] && { found="$a"; break; }
+done
+[ -n "$found" ] && ok "agent: $found" || bad "no polkit agent installed (sudo dnf install polkit-gnome or mate-polkit)"
+pgrep -f "polkit.*agent|hyprpolkitagent" >/dev/null && ok "an agent is running" || bad "no agent running"
+
+echo "== Middle-click paste"
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/dusk/dusk.conf"
+mcp="$(sed -n 's/^ *middle_click_paste *= *//p' "$conf" 2>/dev/null | tail -n 1)"
+[ "${mcp:-true}" = "false" ] && bad "turned off in Settings > Desktop & clipboard" || ok "on in Dusk's settings"
+v="$(gsettings get org.gnome.desktop.interface gtk-enable-primary-paste 2>/dev/null)"
+[ "$v" = "false" ] && bad "GTK apps have it off (gtk-enable-primary-paste false)" || ok "GTK apps: gtk-enable-primary-paste ${v:-unset}"
+if have wl-paste; then
+  p="$(timeout 2 wl-paste --primary --no-newline 2>&1 | head -c 60)"
+  case "$p" in
+    "") bad "nothing selected right now (select some text in an app, then run this again)" ;;
+    *"No selection"*|*"not supported"*|*"Nothing"*) bad "no primary selection: $p" ;;
+    *) ok "selected text is there: \"$p\"" ;;
+  esac
+else
+  bad "wl-clipboard not installed (can't check; sudo dnf install wl-clipboard)"
+fi
+
+echo "== Sound"
+for u in pipewire pipewire-pulse wireplumber; do
+  st="$(systemctl --user is-active "$u" 2>/dev/null)"
+  [ "$st" = active ] && ok "$u running" || bad "$u is $st (systemctl --user restart pipewire pipewire-pulse wireplumber)"
+done
+if have wpctl; then
+  sink="$(timeout 3 wpctl inspect @DEFAULT_AUDIO_SINK@ 2>/dev/null | grep -m1 'node.description' | sed 's/.*= //')"
+  case "$sink" in
+    "") bad "no output device (wpctl status shows what PipeWire sees)" ;;
+    *Dummy*) bad "only \"Dummy Output\": PipeWire can't reach the sound card. Often another login (an old one still"
+             bad "closing, or the login screen's) still has it: systemctl --user restart wireplumber, or reboot" ;;
+    *) ok "speakers / headphones: $sink" ;;
+  esac
+  timeout 3 wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | sed 's/^/  output /'
+  timeout 3 wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null | sed 's/^/  microphone /'
+else
+  bad "wpctl missing (sudo dnf install wireplumber)"
+fi
+wpc="${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d/51-dusk-keep-awake.conf"
+[ -f "$wpc" ] && ok "the sound card stays awake (no clicks in headphones)" \
+  || echo "  info  the sound card may sleep when quiet (a click in headphones): Settings > Media & sound"
+ps="$(cat /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null)"
+if [ -n "$ps" ] && [ "$ps" != 0 ]; then
+  echo "  info  the kernel powers the sound chip down after ${ps}s of quiet. If clicks remain:"
+  echo "        echo 'options snd_hda_intel power_save=0' | sudo tee /etc/modprobe.d/dusk-audio.conf  (then reboot)"
+fi
+
+echo "== Logging into other desktops (GNOME, KDE...)"
+# Dusk tells the user session it's the desktop while it runs and takes that
+# back when it ends; left behind (an old Dusk, a crash), other desktops won't start.
+grep -q "dusk-session" /usr/share/wayland-sessions/dusk.desktop 2>/dev/null && ok "Dusk starts through dusk-session (tidies up when it ends)" \
+  || bad "the login screen starts dusk directly: run ./build.sh install again"
+systemctl --user is-active graphical-session.target >/dev/null 2>&1 && \
+  echo "  graphical-session.target is up (normal inside a desktop; after logging out it stops GNOME starting)"
+env_now="$(systemctl --user show-environment 2>/dev/null | grep -E '^(XDG_CURRENT_DESKTOP|WAYLAND_DISPLAY)=')"
+echo "$env_now" | sed 's/^/  user session: /'
+for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+  printf '  login session %s: %s %s %s %s\n' "$s" "$(loginctl show-session "$s" -p Name --value 2>/dev/null)" \
+    "$(loginctl show-session "$s" -p Type --value 2>/dev/null)" \
+    "$(loginctl show-session "$s" -p Desktop --value 2>/dev/null)" "$(loginctl show-session "$s" -p State --value 2>/dev/null)"
+done
+
+echo "== Lock & login screen"
+[ -f /etc/pam.d/dusk-lock ] && ok "lock screen password check installed" || bad "no /etc/pam.d/dusk-lock (./build.sh install): the lock screen uses the login check instead"
+if grep -q dusk-greeter /etc/greetd/config.toml 2>/dev/null; then
+  bad "Dusk's old login screen is still set up: run ./build.sh install to put GDM back"
+elif systemctl is-enabled gdm >/dev/null 2>&1; then
+  ok "login screen: GNOME's (GDM)"
+else
+  bad "GDM isn't enabled: sudo systemctl enable gdm"
+fi
+
+echo "== Fonts"
+fams="$(fc-list : family 2>/dev/null)"
+for f in "Google Sans" "Google Sans Code"; do
+  printf '%s' "$fams" | grep -q "$f" && ok "$f installed" || bad "$f missing (./build.sh fonts)"
+done
+have gsettings && echo "  apps: $(gsettings get org.gnome.desktop.interface font-name 2>/dev/null), terminals: $(gsettings get org.gnome.desktop.interface monospace-font-name 2>/dev/null)"
+
+echo "== Bluetooth"
+ls /sys/class/bluetooth 2>/dev/null | grep -q '^hci' && ok "adapter: $(ls /sys/class/bluetooth | grep '^hci' | tr '\n' ' ')" \
+  || bad "the kernel shows no Bluetooth adapter (none built in, switched off in the BIOS, or its driver/firmware missing)"
+if have bluetoothctl; then
+  systemctl is-active bluetooth >/dev/null 2>&1 && ok "bluetooth service running" || bad "bluetooth service not running (sudo systemctl enable --now bluetooth)"
+  rfkill list bluetooth 2>/dev/null | grep -q "Soft blocked: yes" && bad "blocked by rfkill (airplane mode?)" || ok "not blocked"
+  timeout 3 bluetoothctl show 2>/dev/null | grep -E "Powered|Pairable|Discoverable" | sed 's/^\s*/  /'
+else
+  bad "bluetoothctl missing (Fedora: sudo dnf install bluez · Arch: sudo pacman -S bluez bluez-utils · Debian/Ubuntu: sudo apt install bluez)"
+fi
+
+echo "== Media wave, lyrics and recording"
+have parec && ok "parec (the wave follows the music)" || { have pw-record && ok "pw-record (the wave follows the music)" || bad "neither parec nor pw-record: the wave only sways (sudo dnf install pulseaudio-utils)"; }
+have python3 && ok "python3 (lyrics)" || bad "python3 missing: no lyrics"
+have dusk-lyrics && ok "dusk-lyrics installed" || bad "dusk-lyrics missing (./build.sh install)"
+{ have songrec || flatpak list --app --columns=application 2>/dev/null | grep -qi songrec || ls ~/.local/share/applications /usr/share/applications 2>/dev/null | grep -qi songrec; } && ok "SongRec: songs with odd names are recognised by ear" || echo "  info  no SongRec (./build.sh install adds it from Flathub): lyrics only for songs found by name"
+lc="${XDG_CACHE_HOME:-$HOME/.cache}/dusk/lyrics"
+echo "  lyrics found so far: $(ls "$lc"/*.lrc 2>/dev/null | wc -l), not found: $(ls "$lc"/*.miss 2>/dev/null | wc -l)"
+[ -s "$lc/last.log" ] && { echo "  the last lyrics search said:"; sed 's/^/    /' "$lc/last.log"; }
+if have dusk-lyrics; then
+  t="$(timeout 15 dusk-lyrics --title 'Blinding Lights' --artist 'The Weeknd' --duration 200 2>/dev/null | head -n 1)"
+  case "$t" in \[*) ok "LRCLIB answers (lyrics can be found)" ;; *) bad "LRCLIB didn't answer: $t" ;; esac
+fi
+have wf-recorder && ok "wf-recorder (screen recording)" || bad "wf-recorder missing: no screen recording (sudo dnf install wf-recorder)"
+
+echo "== Power mode"
+pp="$(busctl --system get-property org.freedesktop.UPower.PowerProfiles /org/freedesktop/UPower/PowerProfiles \
+      org.freedesktop.UPower.PowerProfiles ActiveProfile 2>/dev/null || busctl --system get-property \
+      net.hadess.PowerProfiles /net/hadess/PowerProfiles net.hadess.PowerProfiles ActiveProfile 2>&1)"
+case "$pp" in
+  s\ *) ok "power-profiles-daemon answers: $pp" ;;
+  *) bad "no power-profiles-daemon (sudo dnf install tuned-ppd or power-profiles-daemon): $pp" ;;
+esac
+
+echo "== Graphics (flickering browsers and games)"
+gpu="$(lspci 2>/dev/null | grep -Ei 'vga|3d|display' | sed 's/^[^:]*: //' | head -n 3)"
+[ -n "$gpu" ] && printf '%s\n' "$gpu" | sed 's/^/  /'
+if lsmod 2>/dev/null | grep -q '^nvidia'; then
+  ver="$(cat /sys/module/nvidia/version 2>/dev/null)"
+  ok "NVIDIA driver ${ver:-loaded}"
+  case "$ver" in
+    5[6-9]*|[6-9]*) ok "new enough for explicit sync (Dusk 0.14 uses it: no more flickering Chrome/Vivaldi/XWayland)" ;;
+    *) bad "driver older than 560: Chrome-type browsers and XWayland apps can flicker; update it, or start them with --ozone-platform=wayland" ;;
+  esac
+  [ "$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null)" = Y ] && ok "nvidia-drm modeset on" || bad "nvidia-drm modeset off (add nvidia-drm.modeset=1 to the kernel command line)"
+fi
+for b in vivaldi vivaldi-stable google-chrome chromium brave-browser; do
+  if pgrep -x "$b" >/dev/null 2>&1 || pgrep -f "/$b" >/dev/null 2>&1; then
+    if pgrep -af "$b" | grep -q -- "--ozone-platform=wayland"; then ok "$b runs natively on Wayland"
+    else echo "  info  $b may be running through XWayland: if it flickers, set vivaldi://flags > Preferred Ozone platform > Wayland (or Auto)"; fi
+  fi
+done
+
+echo "== Games"
+sl="${XDG_STATE_HOME:-$HOME/.local/state}/dusk/dusk.log"
+es="$(grep -h "Explicit sync" "$sl" 2>/dev/null | tail -n 1)"
+[ -n "$es" ] && echo "  $es" | sed 's/.*Explicit sync/  explicit sync/'
+grep -q "^allow_tearing *= *false" "${XDG_CONFIG_HOME:-$HOME/.config}/dusk/dusk.conf" 2>/dev/null \
+  && echo "  tearing for full-screen games: off" || echo "  tearing for full-screen games: allowed when a game asks"
+
+echo "== Crashes"
+sd="${XDG_STATE_HOME:-$HOME/.local/state}/dusk"
+if [ -s "$sd/crash.log" ]; then
+  bad "Dusk crashed. The last time (send this):"
+  awk '/^=== Dusk crashed/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$sd/crash.log" | head -n 60 | sed 's/^/    /'
+  if [ -s "$sd/dusk.log.old" ]; then
+    echo "  last lines Dusk printed before that:"
+    tail -n 25 "$sd/dusk.log.old" | sed 's/^/    /'
+  fi
+fi
+sc="$HOME/.cache/dusk/settings-crash.log"
+if [ -s "$sc" ]; then
+  bad "Dusk Settings crashed. The last time (send this):"
+  awk '/^=== Dusk Settings/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$sc" | head -n 50 | sed 's/^/    /'
+fi
+if have coredumpctl; then
+  last="$(coredumpctl list dusk-settings --no-pager --no-legend 2>/dev/null | tail -n 2)"
+  [ -n "$last" ] && { echo "  Settings crash dumps:"; printf '%s\n' "$last" | sed 's/^/    /'; }
+  last="$(coredumpctl list dusk --no-pager --no-legend 2>/dev/null | tail -n 3)"
+  if [ -n "$last" ]; then
+    bad "Dusk crashed (newest last):"
+    printf '%s\n' "$last" | sed 's/^/        /'
+    echo "  where it crashed (send this):"
+    coredumpctl info dusk --no-pager 2>/dev/null | sed -n '/Stack trace of thread/,/^$/p' | head -n 25 | sed 's/^/    /'
+  else
+    ok "no Dusk crashes recorded"
+  fi
+else
+  echo "  info  install systemd-coredump to see crashes (sudo dnf install systemd-udev)"
+fi
+
+echo "== Busy right now (averaged over 5 seconds)"
+if have top; then
+  top -b -d 5 -n 2 -o %CPU 2>/dev/null | awk '/^ *PID/{n++} n==2' | head -n 9 | sed 's/^/  /'
+else
+  ps -eo pcpu,comm --sort=-pcpu | head -n 9 | sed 's/^/  /'
+fi
+echo "  (dusk near 0% when nothing moves is normal; above ~3% while idle, send this output)"

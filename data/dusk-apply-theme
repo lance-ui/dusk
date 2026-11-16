@@ -1,0 +1,254 @@
+#!/bin/sh
+# Makes other apps follow Dusk's look: light or dark, the accent colour and the font.
+# Run by Dusk whenever one of those changes (based on Arqen shell's apply-theme.sh).
+#   GNOME / libadwaita / GTK 4, Flatpak apps through the portal   -> gsettings (checked with dconf)
+#   GTK 3 apps                                                      -> adw-gtk3 / Adwaita(-dark), settings.ini
+#   the exact accent in GTK 3 and GTK 4 apps                        -> a marked block in gtk.css
+#   Qt / KDE apps                                                   -> a qt6ct / qt5ct colour scheme
+#   Chrome, Chromium, Brave, Edge...                                -> --force-dark-mode while dark
+#
+# usage: dusk-apply-theme DARK(1|0) ACCENT(#rrggbb) ACCENT_NAME FONT FULL(1|0) OLED(1|0) [MONO_FONT SIZE MONO_SIZE]
+#   FULL=0 only sets light/dark and the accent (Settings > Appearance > "Style other apps" off).
+#   OLED=1 (with DARK=1): apps' dark backgrounds become pure black too (off: GNOME's own dark).
+dark="$1"; acc="$2"; accname="$3"; font="${4:-}"; full="${5:-1}"; oled="${6:-0}"
+mono="${7:-}"; fsize="${8:-10}"; msize="${9:-11}"
+# A colour that isn't #rrggbb (Dusk 0.13/0.14 lost it to an unquoted "#"):
+# take it from Dusk's settings, else Dusk's blue.
+case "$acc" in
+  \#[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
+  *) acc="$(sed -n 's/^[[:space:]]*accent[[:space:]]*=[[:space:]]*\(#[0-9a-fA-F]\{6\}\).*/\1/p' \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/dusk/dusk.conf" 2>/dev/null | tail -n 1)"
+     [ -n "$acc" ] || acc="#4d8df6" ;;
+esac
+[ "$dark" = 1 ] || oled=0
+C="${XDG_CONFIG_HOME:-$HOME/.config}"
+have() { command -v "$1" >/dev/null 2>&1; }
+themedir() { for d in "$HOME/.local/share/themes" "$HOME/.themes" /usr/share/themes; do [ -d "$d/$1" ] && { echo "$d/$1"; return; }; done; }
+
+# ---- gsettings: only what differs (every write makes GTK apps restyle) ----
+gs() {
+  have gsettings || return 0
+  cur="$(gsettings get org.gnome.desktop.interface "$1" 2>/dev/null)"
+  { [ "$cur" = "'$2'" ] || [ "$cur" = "$2" ]; } && return 0
+  gsettings set org.gnome.desktop.interface "$1" "$2" 2>/dev/null || true
+}
+if [ "$dark" = 1 ]; then
+  gs color-scheme prefer-dark
+else
+  # "prefer-light" exists from GNOME 47; older versions only know "default"
+  cur="$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)"
+  if [ "$cur" != "'prefer-light'" ] && [ "$cur" != "'default'" ]; then
+    gsettings set org.gnome.desktop.interface color-scheme prefer-light 2>/dev/null || gs color-scheme default
+  fi
+fi
+[ -n "$accname" ] && gs accent-color "$accname"
+# The fonts: apps' text, and terminals / code (GNOME Terminal, Ptyxis, editors...)
+if [ "$full" = 1 ]; then
+  [ -n "$font" ] && gs font-name "$font $fsize"
+  [ -n "$font" ] && gs document-font-name "$font $fsize"
+  [ -n "$mono" ] && gs monospace-font-name "$mono $msize"
+  # Terminals that keep their own font setting: kitty, foot, alacritty
+  # (a marked block / include, the rest of their file is kept).
+  if [ -n "$mono" ]; then
+    k="$C/kitty/kitty.conf"
+    if [ -f "$k" ] || have kitty; then
+      mkdir -p "$C/kitty"; [ -f "$k" ] || : > "$k"
+      sed -i '/# dusk-start/,/# dusk-end/d' "$k"
+      printf '# dusk-start (Dusk sets the font: Settings > Appearance > Fonts)\nfont_family %s\nfont_size %s\n# dusk-end\n' "$mono" "$msize" >> "$k"
+    fi
+    f="$C/foot/foot.ini"
+    if [ -f "$f" ] || have foot; then
+      mkdir -p "$C/foot"; [ -f "$f" ] || : > "$f"
+      if grep -q '^font=' "$f"; then sed -i "s|^font=.*|font=$mono:size=$msize|" "$f"
+      else sed -i "1i font=$mono:size=$msize" "$f"; fi
+    fi
+  fi
+fi
+
+# some setups ignore gsettings (no dconf service, a stale profile): make sure it took
+if have gsettings && have dconf; then
+  want=$([ "$dark" = 1 ] && echo prefer-dark || echo prefer-light)
+  now="$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)"
+  case "$now" in
+    "'$want'") ;;
+    "'default'") [ "$dark" = 1 ] && dconf write /org/gnome/desktop/interface/color-scheme "'prefer-dark'" ;;
+    *) dconf write /org/gnome/desktop/interface/color-scheme "'$want'" ;;
+  esac
+fi
+
+# ---- GTK 3 theme: adw-gtk3 looks like libadwaita; else Adwaita. A custom theme is left alone,
+# except that a theme with a -dark twin follows the mode. ----
+gtk="$(gsettings get org.gnome.desktop.interface gtk-theme 2>/dev/null | tr -d "'")"
+case "$gtk" in
+  ""|Adwaita|Adwaita-dark|adw-gtk3|adw-gtk3-dark)
+    if [ -n "$(themedir adw-gtk3)" ] || [ -n "$(themedir adw-gtk3-dark)" ]; then
+      [ "$dark" = 1 ] && gtk=adw-gtk3-dark || gtk=adw-gtk3
+    else
+      [ "$dark" = 1 ] && gtk=Adwaita-dark || gtk=Adwaita
+    fi ;;
+  *-dark|*-Dark)
+    if [ "$dark" != 1 ]; then l="${gtk%-[dD]ark}"; [ -n "$(themedir "$l")" ] && gtk="$l"; fi ;;
+  *)
+    if [ "$dark" = 1 ]; then for d in "$gtk-dark" "$gtk-Dark"; do [ -n "$(themedir "$d")" ] && { gtk="$d"; break; }; done; fi ;;
+esac
+gs gtk-theme "$gtk"
+
+# ---- settings.ini for GTK apps that don't read gsettings ----
+[ "$full" = 1 ] && for v in 3.0 4.0; do
+  mkdir -p "$C/gtk-$v"
+  f="$C/gtk-$v/settings.ini"
+  tmp="$f.dusk-tmp"
+  # keep other lines the user has there
+  { echo "[Settings]"
+    echo "gtk-application-prefer-dark-theme=$dark"
+    [ "$v" = 3.0 ] && echo "gtk-theme-name=$gtk"
+    [ -n "$font" ] && echo "gtk-font-name=$font $fsize"
+    [ -f "$f" ] && grep -vE '^\[Settings\]|^gtk-application-prefer-dark-theme=|^gtk-theme-name=|^gtk-font-name=' "$f"
+  } > "$tmp"
+  if cmp -s "$tmp" "$f"; then rm -f "$tmp"; else mv "$tmp" "$f"; fi
+done
+
+# ---- the exact accent in GTK apps: a marked block in gtk.css (the rest of the file is kept) ----
+block() {   # $1 = file, $2 = text
+  mkdir -p "$(dirname "$1")"; [ -f "$1" ] || : > "$1"
+  tmp="$1.dusk-tmp"
+  sed '/\/\* dusk-start/,/\/\* dusk-end \*\//d' "$1" > "$tmp"
+  printf '%s\n' "$2" >> "$tmp"
+  if cmp -s "$tmp" "$1"; then rm -f "$tmp"; else mv "$tmp" "$1"; fi
+}
+# OLED black: libadwaita/GTK backgrounds go pure black in dark mode. GTK 4 only uses it
+# while dark (a media query), GTK 3 gets it only while Dusk is dark.
+oled3=""; oled4=""
+if [ "$oled" = 1 ]; then
+  oled3="@define-color window_bg_color #000000;
+@define-color view_bg_color #000000;
+@define-color headerbar_bg_color #000000;
+@define-color headerbar_backdrop_color #000000;
+@define-color sidebar_bg_color #0a0a0b;
+@define-color secondary_sidebar_bg_color #0a0a0b;
+@define-color card_bg_color #121214;
+@define-color dialog_bg_color #0c0c0e;
+@define-color popover_bg_color #0c0c0e;
+@define-color theme_bg_color #000000;
+@define-color theme_base_color #000000;
+@define-color theme_unfocused_bg_color #000000;
+@define-color theme_unfocused_base_color #000000;"
+  oled4="@media (prefers-color-scheme: dark) {
+  :root {
+    --window-bg-color: #000000; --view-bg-color: #000000;
+    --headerbar-bg-color: #000000; --headerbar-backdrop-color: #000000;
+    --sidebar-bg-color: #0a0a0b; --sidebar-backdrop-color: #0a0a0b;
+    --secondary-sidebar-bg-color: #0a0a0b; --secondary-sidebar-backdrop-color: #0a0a0b;
+    --card-bg-color: #121214; --dialog-bg-color: #0c0c0e; --popover-bg-color: #0c0c0e;
+    --thumbnail-bg-color: #121214; --overview-bg-color: #000000;
+  }
+}"
+fi
+# Text on the accent: dark on light accents (olive, gold, cream...), else white.
+hexpair() { printf '%d' "0x$(printf '%s' "$acc" | cut -c"$1"-"$2")" 2>/dev/null || echo 128; }
+luma=$(( (2126 * $(hexpair 2 3) + 7152 * $(hexpair 4 5) + 722 * $(hexpair 6 7)) / 10000 ))
+if [ "$luma" -gt 158 ]; then accfg="#1c1c21"; else accfg="#ffffff"; fi
+
+# The accent on the widgets themselves, as plain colours. Some GTK/libadwaita
+# versions ignore (or drop) the accent variables from a user stylesheet,
+# which left switches that are on, "suggested" buttons (Rename, Open...),
+# ticked boxes and sliders without any colour: they looked invisible.
+widgets="switch:checked, switch:checked:hover, switch:checked:active { background-color: $acc; }
+switch:checked > slider { background-color: #ffffff; }
+button.suggested-action, button.suggested-action:hover, button.suggested-action:active,
+button.suggested-action:checked, button.suggested-action:focus,
+splitbutton.suggested-action > button, splitbutton.suggested-action > menubutton > button { background-color: $acc; color: $accfg; }
+button.suggested-action:disabled { background-color: alpha($acc, 0.5); color: alpha($accfg, 0.6); }
+check:checked, check:indeterminate, radio:checked, checkbutton check:checked, checkbutton radio:checked,
+row check:checked { background-color: $acc; color: $accfg; border-color: $acc; }
+scale highlight, scale > trough > highlight, progressbar > trough > progress, levelbar > trough > block.filled,
+levelbar block.filled { background-color: $acc; }
+spinner { color: $acc; }"
+
+block "$C/gtk-3.0/gtk.css" "/* dusk-start: accent from Dusk Settings, this block is rewritten */
+@define-color accent_color $acc;
+@define-color accent_bg_color $acc;
+@define-color accent_fg_color $accfg;
+@define-color theme_selected_bg_color $acc;
+@define-color theme_selected_fg_color $accfg;
+$oled3
+$widgets
+/* dusk-end */"
+block "$C/gtk-4.0/gtk.css" "/* dusk-start: accent from Dusk Settings, this block is rewritten */
+@define-color accent_color $acc;
+@define-color accent_bg_color $acc;
+@define-color accent_fg_color $accfg;
+:root { --accent-color: $acc; --accent-bg-color: $acc; --accent-fg-color: $accfg; }
+$widgets
+$oled4
+/* dusk-end */"
+# GTK reads gtk.css when an app starts: apps already open (and ones that keep
+# running in the background, like Software and Files) show it once restarted.
+
+# The exact accent above is always written (GNOME apps would otherwise only get the
+# nearest of GNOME's nine accents). The rest only with "Style other apps" on.
+[ "$full" = 1 ] || exit 0
+
+# ---- Chrome, Chromium, Brave, Vivaldi, Edge, Opera ----
+# They follow the portal when their own mode is "Device", but not every build does; their flags
+# file (read at start) also says it.
+for n in chrome chromium brave vivaldi microsoft-edge microsoft-edge-stable opera; do
+  for f in "$C/$n-flags.conf" "$HOME"/.var/app/*/config/"$n"-flags.conf; do
+    [ -f "$f" ] || continue
+    if [ "$dark" = 1 ]; then grep -qxF -- "--force-dark-mode" "$f" || echo "--force-dark-mode" >> "$f"
+    else grep -qxF -- "--force-dark-mode" "$f" && sed -i '/^--force-dark-mode$/d' "$f"; fi
+  done
+done
+
+# ---- Qt apps: qt6ct / qt5ct with Dusk's colours (used when qt6ct is installed) ----
+if [ "$oled" = 1 ]; then
+  # window text, button, light, midlight, dark, mid, text, bright text, button text, base, window,
+  # shadow, highlight, highlighted text, link, visited link, alternate base, no role, tooltip base,
+  # tooltip text, placeholder text
+  P="#f2f2f5, #141416, #2a2a2e, #1c1c1f, #000000, #101012, #f2f2f5, #ffffff, #f2f2f5, #000000, #000000, #000000, $acc, $accfg, $acc, $acc, #0a0a0b, #000000, #121214, #f2f2f5, #9a99a3"
+  D="#6c6b73, #141416, #2a2a2e, #1c1c1f, #000000, #101012, #6c6b73, #ffffff, #6c6b73, #000000, #000000, #000000, #2a2a2e, #9a99a3, $acc, $acc, #0a0a0b, #000000, #121214, #f2f2f5, #6c6b73"
+elif [ "$dark" = 1 ]; then
+  # GNOME's dark greys (libadwaita)
+  P="#ffffff, #3a3a3e, #48484c, #404044, #161618, #2e2e32, #ffffff, #ffffff, #ffffff, #1d1d20, #222226, #000000, $acc, $accfg, $acc, $acc, #2e2e32, #000000, #36363a, #ffffff, #a2a2a7"
+  D="#77777b, #3a3a3e, #48484c, #404044, #161618, #2e2e32, #77777b, #ffffff, #77777b, #1d1d20, #222226, #000000, #48484c, #a2a2a7, $acc, $acc, #2e2e32, #000000, #36363a, #ffffff, #77777b"
+else
+  P="#1f1d24, #f1eff4, #ffffff, #f7f6f9, #c8c6cf, #dcdae2, #1f1d24, #000000, #1f1d24, #ffffff, #f1eff4, #9a98a2, $acc, $accfg, $acc, $acc, #f6f5f8, #000000, #ffffff, #1f1d24, #85838d"
+  D="#9a98a2, #f1eff4, #ffffff, #f7f6f9, #c8c6cf, #dcdae2, #9a98a2, #000000, #9a98a2, #ffffff, #f1eff4, #9a98a2, #dcdae2, #6c6b73, $acc, $acc, #f6f5f8, #000000, #ffffff, #1f1d24, #9a98a2"
+fi
+f6="${font:-Sans}"
+[ "$f6" = Sans ] && f6="Noto Sans"
+for q in qt6ct qt5ct; do
+  have "$q" || continue
+  mkdir -p "$C/$q/colors"
+  printf '[ColorScheme]\nactive_colors=%s\ndisabled_colors=%s\ninactive_colors=%s\n' "$P" "$D" "$P" > "$C/$q/colors/dusk.conf"
+  if [ "$q" = qt6ct ]; then fstr="$f6,$fsize,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"; else fstr="$f6,$fsize,-1,5,50,0,0,0,0,0"; fi
+  icons="$(gsettings get org.gnome.desktop.interface icon-theme 2>/dev/null | tr -d "'")"
+  {
+    echo "[Appearance]"
+    echo "color_scheme_path=$C/$q/colors/dusk.conf"
+    echo "custom_palette=true"
+    [ -n "$icons" ] && echo "icon_theme=$icons"
+    echo "standard_dialogs=default"
+    echo "style=Fusion"
+    echo
+    echo "[Fonts]"
+    echo "general=\"$fstr\""
+    if [ -n "$mono" ]; then
+      if [ "$q" = qt6ct ]; then echo "fixed=\"$mono,$msize,-1,5,400,0,0,0,0,0,0,0,0,0,0,1\""; else echo "fixed=\"$mono,$msize,-1,5,50,0,0,0,0,0\""; fi
+    fi
+  } > "$C/$q/$q.conf"
+done
+
+# ---- Flatpak apps: let them read the GTK settings and theme ----
+if have flatpak; then
+  for t in "$gtk" adw-gtk3 adw-gtk3-dark; do
+    src="$(themedir "$t")"
+    case "$src" in /usr/share/themes/*) [ -d "$HOME/.local/share/themes/$t" ] || { mkdir -p "$HOME/.local/share/themes"; cp -r "$src" "$HOME/.local/share/themes/"; } ;; esac
+  done
+  flatpak override --user \
+    --filesystem=xdg-config/gtk-3.0:ro --filesystem=xdg-config/gtk-4.0:ro \
+    --filesystem=xdg-data/themes:ro --filesystem=xdg-config/qt6ct:ro >/dev/null 2>&1 || true
+  # Flatpak libadwaita apps can only learn light/dark from the portal
+  flatpak override --user --unset-env=ADW_DISABLE_PORTAL >/dev/null 2>&1 || true
+fi
+exit 0

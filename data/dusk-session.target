@@ -1,0 +1,9 @@
+# Started by Dusk when you log in: tells systemd a graphical session is running,
+# so the services that wait for one (the desktop portal, which gives apps
+# light/dark, file pickers and more) can start. Stopped when Dusk exits.
+[Unit]
+Description=Dusk desktop session
+Documentation=man:systemd.special(7)
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target

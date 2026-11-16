@@ -1,0 +1,45 @@
+#!/bin/sh
+# Starts Dusk from the login screen, and tidies up after it however it ends
+# (logged out, crashed, killed).
+#
+# While Dusk runs, it tells your user session (systemd and D-Bus) that it is
+# the desktop: WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP=Dusk:GNOME and so on, and
+# starts dusk-session.target ("a graphical session is running"). That session
+# outlives a logout, so if this were left behind, GNOME or KDE logged into
+# next would find a graphical session "already running" and refuse to start,
+# and their apps would think they're on Dusk.
+
+DUSK=/usr/local/bin/dusk
+VARS="WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE \
+QT_QPA_PLATFORMTHEME ADW_DISABLE_PORTAL"
+
+tidy() {
+	systemctl --user stop dusk-session.target >/dev/null 2>&1
+	# Services started for the session (the desktop portals) keep
+	# graphical-session.target up after ours stops; GNOME refuses to start
+	# while it's up ("a graphical session is already running").
+	systemctl --user stop graphical-session.target graphical-session-pre.target >/dev/null 2>&1
+	# shellcheck disable=SC2086
+	systemctl --user unset-environment $VARS >/dev/null 2>&1
+	systemctl --user reset-failed >/dev/null 2>&1
+}
+
+# Apps started from Dusk (tray apps, the password prompt, a screen recorder)
+# keep running after it and leave this login "closing": they're ended with it,
+# which also hands the sound card back for the next login.
+end_session() {
+	[ -n "$XDG_SESSION_ID" ] && loginctl terminate-session "$XDG_SESSION_ID" >/dev/null 2>&1
+}
+
+# Left over from a Dusk that crashed last time.
+tidy
+
+"$DUSK" "$@" &
+pid=$!
+# Logging out sends us a signal too: pass it on, wait, then tidy up.
+trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; tidy; end_session; exit 0' HUP TERM INT
+wait "$pid"
+status=$?
+tidy
+end_session
+exit "$status"

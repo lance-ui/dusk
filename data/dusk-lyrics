@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""dusk-lyrics: synced (timed) lyrics for a song, from LRCLIB (https://lrclib.net:
+free, no account), or NetEase Cloud Music when LRCLIB doesn't have it or is down. Dusk runs it when a song starts; the result is cached.
+
+  dusk-lyrics --title TITLE --artist ARTIST [--album ALBUM] [--duration SECONDS]
+              [--recognize] [--out FILE]
+
+Prints the lyrics as LRC ("[01:02.50] a line"), or writes them to FILE.
+--recognize: if the song isn't found by its name (videos with odd titles),
+listen to a few seconds of what's playing and ask SongRec (if installed) what
+it is, then look again. Exit status: 0 found, 1 not found, 2 the sites are down."""
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, urllib.parse, urllib.request, wave
+
+API = "https://lrclib.net/api"
+STARTED = __import__("time").time()
+AGENT = "Dusk desktop (https://github.com/lance-ui/dusk)"
+NOISE = re.compile(r"\s*[\(\[\{][^\)\]\}]*\b(official|video|audio|lyrics?|visuali[sz]er|hd|hq|4k|mv|m/v|"
+                   r"remaster(ed)?|live|explicit|clean|extended|looped|sped up|slowed|reverb|nightcore|"
+                   r"music video|full song|color coded)\b[^\)\]\}]*[\)\]\}]", re.I)
+FEAT = re.compile(r"\s*[\(\[]?\s*\b(feat\.?|ft\.?|featuring)\s.*$", re.I)
+
+
+def clean_title(t):
+    t = NOISE.sub("", t)
+    t = re.sub(r"\s*\|.*$", "", t)           # "Song | Channel"
+    t = re.sub(r"\s*#\w+", "", t)            # hashtags
+    return FEAT.sub("", t).strip(" -–—_")
+
+
+def clean_artist(a):
+    a = re.sub(r"\s*-\s*Topic$", "", a)
+    a = re.sub(r"VEVO$", "", a)
+    a = re.split(r"\s*(,|&| x | feat\.? | ft\.? )\s*", a)[0]
+    return a.strip()
+
+
+def guesses(title, artist):
+    """(track, artist) pairs to try, best first."""
+    out = []
+    t, a = clean_title(title), clean_artist(artist)
+    # "Artist - Title" (videos, uploads by channels): that split first.
+    m = re.match(r"^(.+?)\s+[-–—]\s+(.+)$", t)
+    if m:
+        out.append((clean_title(m.group(2)), clean_artist(m.group(1))))
+    if t:
+        out.append((t, a))
+    if m:
+        out.append((clean_title(m.group(2)), ""))   # the title alone
+    seen, unique = set(), []
+    for g in out:
+        if g[0] and g not in seen:
+            seen.add(g)
+            unique.append(g)
+    return unique
+
+
+def log(msg):
+    """What it did, for Dusk to show ("why no lyrics?")."""
+    print(msg, file=sys.stderr, flush=True)
+
+
+class Down(Exception):
+    """A lyrics site is down or unreachable (not the same as "no lyrics")."""
+
+
+def fetch_json(url, headers=None, tries=3):
+    """GET a JSON answer; a busy or broken server (5xx, timeouts) is asked again
+    after a short wait. 404 is None."""
+    import time
+    h = {"User-Agent": AGENT}
+    h.update(headers or {})
+    last = None
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(1.5 * attempt)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=8) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            if e.code < 500 and e.code != 429:
+                raise Down("HTTP Error %d: %s" % (e.code, e.reason))
+            last = "HTTP Error %d: %s" % (e.code, e.reason)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last = str(getattr(e, "reason", e))
+        except ValueError:
+            last = "a broken answer"
+    raise Down(last or "no answer")
+
+
+def get(path, params):
+    return fetch_json(API + path + "?" + urllib.parse.urlencode(params))
+
+
+def best(items, duration):
+    """The synced lyrics closest in length (a video's intro or outro makes it
+    longer: still better than nothing, and the timing can be nudged)."""
+    synced = [i for i in items or [] if isinstance(i, dict) and i.get("syncedLyrics")]
+    if not synced:
+        return None
+    if duration:
+        synced.sort(key=lambda i: abs((i.get("duration") or 0) - duration))
+    return synced[0]["syncedLyrics"]
+
+
+def look_up(title, artist, album, duration):
+    tried = guesses(title, artist)
+    log("Looking up: " + "; ".join((w + " - " if w else "") + t for t, w in tried))
+    for track, who in tried:
+        if who:
+            params = {"track_name": track, "artist_name": who}
+            if album:
+                params["album_name"] = album
+            if 1 <= duration <= 3600:
+                params["duration"] = int(round(duration))
+            hit = get("/get", params)
+            if not (hit and hit.get("syncedLyrics")) and ("duration" in params or "album_name" in params):
+                hit = get("/get", {"track_name": track, "artist_name": who})   # another length / album
+            if hit and hit.get("syncedLyrics"):
+                return hit["syncedLyrics"]
+        if who:
+            found = best(get("/search", {"track_name": track, "artist_name": who}), duration)
+            if found:
+                return found
+        found = best(get("/search", {"q": (who + " " + track).strip()}), duration)
+        if found:
+            return found
+    # Last: just the title.
+    # (Only a close match in length: another song can have the same name.)
+    for track, _ in guesses(title, artist)[:1]:
+        if not duration:
+            break
+        items = [i for i in get("/search", {"track_name": track}) or []
+                 if isinstance(i, dict) and i.get("syncedLyrics") and abs((i.get("duration") or 0) - duration) <= 4]
+        if items:
+            return best(items, duration)
+    return None
+
+
+# ---- Second source: NetEase Cloud Music (also free, no account) -------------
+# Used when LRCLIB doesn't have the song, or is down. It has synced lyrics for
+# a great many songs, Western ones included.
+NE = "https://music.163.com/api"
+NE_HEAD = {"Referer": "https://music.163.com/", "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Dusk"}
+CREDIT = re.compile(r"^\[[\d:.]+\]\s*(作词|作曲|编曲|制作人|混音|母带|和声|吉他|贝斯|鼓|录音|监制|出品|"
+                    r"lyrics?|composer|producer|arranger|written by|mix(ed)? by|master(ed)? by)\s*[:：]", re.I)
+
+
+def norm(t):
+    return re.sub(r"[^\w]+", " ", t.lower()).strip()
+
+
+def netease_lrc(text):
+    """Synced lines only, without the credits some songs start with."""
+    lines = [l for l in (text or "").splitlines() if l.strip() and not CREDIT.match(l)]
+    timed = [l for l in lines if re.match(r"^\[\d+:\d+", l)]
+    # All at 0:00 means it isn't really synced.
+    if len(timed) < 4 or len({l[:9] for l in timed}) < 3:
+        return None
+    return "\n".join(lines)
+
+
+def netease(title, artist, duration):
+    for track, who in guesses(title, artist):
+        q = (who + " " + track).strip()
+        res = fetch_json(NE + "/search/get?" + urllib.parse.urlencode({"s": q, "type": 1, "limit": 10}),
+                         NE_HEAD) or {}
+        songs = (res.get("result") or {}).get("songs") or []
+        want_t, want_a = norm(track), norm(who)
+        picks = []
+        for sg in songs:
+            name = norm(sg.get("name", ""))
+            names = [norm(a.get("name", "")) for a in (sg.get("artists") or sg.get("ar") or [])]
+            length = (sg.get("duration") or sg.get("dt") or 0) / 1000.0
+            if not name or not (want_t in name or name in want_t):
+                continue
+            if want_a and not any(want_a in n or n in want_a for n in names if n):
+                continue
+            off = abs(length - duration) if duration and length else 0
+            if duration and length and off > 15:
+                continue
+            picks.append((off, sg.get("id")))
+        for _, sid in sorted(picks)[:3]:
+            got = fetch_json(NE + "/song/lyric?" + urllib.parse.urlencode({"id": sid, "lv": 1, "kv": 1, "tv": -1}),
+                             NE_HEAD) or {}
+            lrc = netease_lrc((got.get("lrc") or {}).get("lyric"))
+            if lrc:
+                log("Found on NetEase Cloud Music")
+                return lrc
+    return None
+
+
+def find(title, artist, album, duration):
+    """LRCLIB first, then NetEase. Raises Down only when neither could be asked."""
+    down = []
+    try:
+        lrc = look_up(title, artist, album, duration)
+        if lrc:
+            return lrc
+    except Down as e:
+        log("lrclib.net is down or unreachable (%s)" % e)
+        down.append("lrclib.net")
+    try:
+        log("Trying NetEase Cloud Music")
+        return netease(title, artist, duration)
+    except Down as e:
+        log("NetEase Cloud Music unreachable (%s)" % e)
+        down.append("NetEase")
+    if len(down) == 2:
+        raise Down("lrclib.net and NetEase are both unreachable")
+    if down:
+        raise Down("lrclib.net is down and NetEase doesn't have it")
+    return None
+
+
+def songrec():
+    """How to run SongRec, wherever it came from: a package, Flathub (any
+    install, whatever its id), a snap, or an AppImage with a menu entry."""
+    found = shutil.which("songrec")
+    if found:
+        return [found]
+    for snap in ("/snap/bin/songrec", "/var/lib/snapd/snap/bin/songrec"):
+        if os.access(snap, os.X_OK):
+            return [snap]
+    home = os.path.expanduser("~")
+    # Flatpak: ask it for the app's id (the usual one first), else look at what it exports.
+    flatpak = shutil.which("flatpak") or ("/usr/bin/flatpak" if os.access("/usr/bin/flatpak", os.X_OK) else None)
+    if flatpak:
+        ids = []
+        try:
+            out = subprocess.run([flatpak, "list", "--app", "--columns=application"], capture_output=True,
+                                 text=True, timeout=10).stdout
+            ids = [l.strip() for l in out.splitlines() if "songrec" in l.lower()]
+        except Exception:
+            pass
+        for d in (home + "/.local/share/flatpak/exports/bin", "/var/lib/flatpak/exports/bin"):
+            try:
+                ids += [f for f in os.listdir(d) if "songrec" in f.lower()]
+            except OSError:
+                pass
+        if ids:
+            ids.sort(key=lambda i: i != "com.github.marinm.songrec")
+            return [flatpak, "run", "--command=songrec", ids[0]]
+    # A menu entry (AppImage, a build in your home folder...): run what it runs.
+    dirs = [home + "/.local/share/applications", "/usr/share/applications", "/usr/local/share/applications",
+            home + "/.local/share/flatpak/exports/share/applications", "/var/lib/flatpak/exports/share/applications"]
+    for d in dirs:
+        try:
+            names = [f for f in os.listdir(d) if "songrec" in f.lower() and f.endswith(".desktop")]
+        except OSError:
+            continue
+        for n in names:
+            try:
+                with open(os.path.join(d, n), encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if line.startswith("Exec="):
+                            import shlex
+                            argv = [x for x in shlex.split(line[5:].strip()) if not x.startswith("%")]
+                            if argv and "flatpak" in os.path.basename(argv[0]):
+                                app = [x for x in argv[1:] if not x.startswith("-") and x != "run"]
+                                if app:
+                                    return [argv[0], "run", "--command=songrec", app[-1]]
+                            elif argv and (os.access(argv[0], os.X_OK) or shutil.which(argv[0])):
+                                return argv[:1]
+                            break
+            except OSError:
+                pass
+    return None
+
+
+def recognise(position=None):
+    """What's playing, by its sound (SongRec, a Shazam client): (title, artist,
+    where the song started in what's playing, in seconds, or None) or None.
+    `position`: how far into what's playing it was when this started (a
+    compilation: the song found starts somewhere in the middle of it)."""
+    run = songrec()
+    if not run:
+        log("Couldn't find SongRec (not as a program, on Flathub or in the app menu), so it couldn't listen")
+        return None
+    # Raw sound from the speakers' monitor, written out as a WAV here (a
+    # recorder stopped by a timeout can leave a WAV with a broken header).
+    if shutil.which("parec"):
+        rec = ["parec", "-d", "@DEFAULT_MONITOR@", "--raw", "--format=s16le", "--rate=16000",
+               "--channels=1", "--client-name=dusk-levels"]
+    elif shutil.which("pw-record"):
+        rec = ["pw-record", "-P", "{ stream.capture.sink = true, application.name = \"dusk-levels\" }",
+               "--rate", "16000", "--channels", "1", "--format", "s16", "-"]
+    else:
+        log("Can't record what's playing (no parec or pw-record)")
+        return None
+    log("Listening with SongRec (" + " ".join(run if len(run) < 2 else [run[0], run[-1]]) + ")")
+    # Under ~/.cache: Flatpak's SongRec can be given a folder there (not one
+    # under /run, where the clip used to go: it couldn't open it).
+    base = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "dusk")
+    os.makedirs(base, exist_ok=True)
+    d = tempfile.mkdtemp(prefix="songrec-", dir=base)
+    wav = os.path.join(d, "clip.wav")
+    try:
+        import time
+        rec_at = time.time()
+        p = subprocess.Popen(rec, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            raw, _ = p.communicate(timeout=9)
+        except subprocess.TimeoutExpired:
+            p.terminate()
+            raw, _ = p.communicate()
+        import array
+        samples = array.array("h", raw[: len(raw) // 2 * 2])
+        if len(samples) < 16000:
+            log("Couldn't record what's playing (got %d bytes)" % len(raw))
+            return None
+        if max(abs(min(samples)), max(samples)) < 150:
+            log("What's playing was silent when it listened (is the sound going to another output?)")
+            return None
+        with wave.open(wav, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(raw)
+        cmd = list(run)
+        if len(run) > 1 and run[1] == "run" and "flatpak" in os.path.basename(run[0]):
+            cmd.insert(2, "--filesystem=" + d)   # let the sandboxed app read the clip
+        size = os.path.getsize(wav) if os.path.exists(wav) else 0
+        if size < 20000:
+            log("The recording was silent or empty (%d bytes)" % size)
+            return None
+        r = subprocess.run(cmd + ["audio-file-to-recognized-song", wav], capture_output=True,
+                           text=True, timeout=40)
+        if r.returncode != 0:
+            log("SongRec failed: " + (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1])
+            return None
+        answer = json.loads(r.stdout)
+        track = answer.get("track") or {}
+        matches = answer.get("matches") or []
+        into = matches[0].get("offset") if matches and isinstance(matches[0], dict) else None
+    except Exception as e:
+        log("SongRec failed: " + str(e))
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    if track.get("title"):
+        log("SongRec heard: " + track.get("subtitle", "") + " - " + track["title"])
+        start = None
+        if position is not None and isinstance(into, (int, float)):
+            # Where the clip was in what's playing, minus how far into the song it was.
+            start = position + (rec_at - STARTED) - float(into)
+        return track["title"], track.get("subtitle", ""), start
+    log("SongRec didn't recognise it")
+    return None
+
+
+# ---- Translation ---------------------------------------------------------------
+# --translate LANG --in FILE --out FILE: FILE has one line of lyrics per line;
+# the output has the same number of lines, translated (empty lines stay empty).
+# Uses Google Translate's free web endpoint (no account). Exit 3: the lyrics
+# are already in that language.
+GT = "https://translate.googleapis.com/translate_a/single"
+
+
+def gtx(text, lang):
+    """(translation, detected source language)."""
+    q = urllib.parse.urlencode({"client": "gtx", "sl": "auto", "tl": lang, "dt": "t", "q": text})
+    d = fetch_json(GT + "?" + q, {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Dusk"})
+    if not isinstance(d, list) or not d:
+        raise Down("a broken answer from the translator")
+    out = "".join(seg[0] for seg in (d[0] or []) if isinstance(seg, list) and seg and isinstance(seg[0], str))
+    src = d[2] if len(d) > 2 and isinstance(d[2], str) else ""
+    return out, src
+
+
+def translate(lines, lang):
+    idx = [i for i, l in enumerate(lines) if l.strip() and l.strip() not in ("♪", "♫")]
+    out = list(lines)
+    if not idx:
+        return out, ""
+    src = ""
+    # In batches (one request for a whole song, usually), line for line.
+    batch, size = [], 0
+    groups = []
+    for i in idx:
+        if batch and size + len(lines[i]) > 1800:
+            groups.append(batch)
+            batch, size = [], 0
+        batch.append(i)
+        size += len(lines[i]) + 1
+    if batch:
+        groups.append(batch)
+    for g in groups:
+        text, src = gtx("\n".join(lines[i].strip() for i in g), lang)
+        got = text.split("\n")
+        if len(got) != len(g):
+            # The lines got merged or split: one at a time instead.
+            got = [gtx(lines[i].strip(), lang)[0] for i in g]
+        for i, t in zip(g, got):
+            out[i] = t.strip()
+    return out, src
+
+
+def main_translate(a):
+    with open(a.input, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    lang = a.translate.split("_")[0].split("-")[0].lower() if a.translate not in ("zh-CN", "zh-TW") else a.translate
+    try:
+        out, src = translate(lines, lang)
+    except Down as e:
+        log("Couldn't translate: " + str(e))
+        return 2
+    except Exception as e:
+        log("Couldn't translate: " + str(e))
+        return 2
+    if src and src.split("-")[0].lower() == lang.split("-")[0].lower():
+        log("The lyrics are already in that language")
+        return 3
+    tmp = a.out + ".part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, a.out)
+    log("Translated" + (" from " + src if src else ""))
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--title", default="")
+    p.add_argument("--artist", default="")
+    p.add_argument("--album", default="")
+    p.add_argument("--duration", type=float, default=0)
+    p.add_argument("--recognize", action="store_true")
+    p.add_argument("--listen-first", action="store_true", help="ask SongRec before the name")
+    p.add_argument("--position", type=float, default=None, help="seconds into what's playing now")
+    p.add_argument("--out")
+    p.add_argument("--translate", metavar="LANG", help="translate the lines in --in into LANG")
+    p.add_argument("--in", dest="input")
+    a = p.parse_args()
+    if a.translate:
+        if not a.input or not a.out:
+            log("--translate needs --in and --out")
+            return 2
+        return main_translate(a)
+    try:
+        lrc = None
+
+        def by_ear():
+            heard = recognise(a.position)
+            if not heard:
+                return None
+            found = find(heard[0], heard[1], "", 0)
+            if not found:
+                return None
+            # Heard, not looked up by name: Dusk listens again when this song
+            # ends (a compilation goes on to the next one). And where it
+            # started in what's playing, so the lines line up.
+            head = "[by:dusk-songrec]\n"
+            if heard[2] is not None and abs(heard[2]) > 1.5:
+                head += "[offset:%d]\n" % int(round(-heard[2] * 1000))
+                log("It started %d:%02d into what's playing" % (int(heard[2]) // 60, int(heard[2]) % 60))
+            return head + found
+
+        if a.listen_first and a.recognize:
+            lrc = by_ear()
+        if not lrc:
+            lrc = find(a.title, a.artist, a.album, a.duration)
+        if not lrc and a.recognize and not a.listen_first:
+            log("Not found by its name")
+            lrc = by_ear()
+    except Down as e:
+        log("Couldn't get lyrics: " + str(e) + ". Dusk tries again in a while.")
+        return 2
+    except Exception as e:
+        log("Couldn't get lyrics: " + str(e))
+        return 2
+    if not lrc:
+        log("No synced lyrics for this song on lrclib.net or NetEase")
+        return 1
+    log("Found")
+    if a.out:
+        tmp = a.out + ".part"
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(lrc)
+        os.replace(tmp, a.out)
+    else:
+        sys.stdout.write(lrc)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

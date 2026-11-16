@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Dusk
+Comment=A floating desktop
+Exec=dusk
+Type=Application
+Icon=dusk
+DesktopNames=Dusk

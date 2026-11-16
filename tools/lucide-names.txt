@@ -1,0 +1,6 @@
+wifi wifi-high wifi-low wifi-zero wifi-off ethernet-port network plane volume volume-1 volume-2 volume-x speaker battery battery-charging bluetooth bluetooth-off sun-moon moon moon-star sun sun-dim bell bell-off bell-ring coffee leaf gauge zap mic mic-off settings power play pause skip-forward skip-back chevron-right chevron-left chevron-up chevron-down lock check x monitor log-out rotate-cw rotate-ccw refresh-cw pencil scan camera square-dashed app-window mouse-pointer-2 timer plus minus clipboard clipboard-paste clipboard-list copy trash folder folder-plus file square-terminal external-link info image layout-grid search smartphone cast monitor-smartphone rotate-ccw-clock palette panel-bottom sliders-horizontal toggle-right sparkles mouse keyboard rocket clock calendar-clock user grip-vertical ellipsis-vertical eye eye-off package usb tablet-smartphone circle-question-mark shield gamepad-2 layers droplet blend wallpaper move maximize-2 minimize-2 lightbulb house grid-2x2 circle-dot circle-x circle-check hard-drive download upload link app-window-mac message-square crosshair inbox list-x dot
+layout-dashboard
+square-stack
+gallery-horizontal-end
+layout-template
+ video square circle quote mic-vocal audio-lines disc-3 headphones circle-stop

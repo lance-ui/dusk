@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+# Dusk's list of where sound can go, for the "Play sound on" menu.
+#
+#   dusk-audio-outputs            one line per output:
+#       SINK<TAB>name<TAB>1 if in use<TAB>label
+#       PORT<TAB>card<TAB>profile<TAB>label      (an output that needs its card
+#                                                  switched first: a monitor's or
+#                                                  TV's HDMI / DisplayPort, often)
+#   dusk-audio-outputs --sink NAME             play on that one
+#   dusk-audio-outputs --port CARD PROFILE     switch the card to it, then play on it
+#
+# Uses pactl (PipeWire's PulseAudio side); playing sound moves along.
+import json
+import subprocess
+import sys
+import time
+
+
+def run(*args, timeout=5):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def pj(*args):
+    try:
+        return json.loads(run("pactl", "-f", "json", *args) or "[]")
+    except Exception:
+        return []
+
+
+def product(port):
+    props = port.get("properties") or {}
+    return props.get("device.product.name") or ""
+
+
+def label_for(desc, port):
+    name = product(port) if port else ""
+    pdesc = (port or {}).get("description", "")
+    if name and pdesc:
+        return f"{name} · {pdesc}"
+    return name or desc or pdesc
+
+
+def move_streams(sink):
+    for inp in pj("list", "sink-inputs"):
+        run("pactl", "move-sink-input", str(inp.get("index")), sink)
+
+
+def use_sink(sink):
+    run("pactl", "set-default-sink", sink)
+    move_streams(sink)
+
+
+def listing():
+    default = run("pactl", "get-default-sink").strip()
+    sinks = pj("list", "sinks")
+    cards = pj("list", "cards")
+    live_ports = set()   # (card, port) already playable as a sink
+    for s in sinks:
+        props = s.get("properties") or {}
+        card = props.get("device.name", "")
+        active = s.get("active_port")
+        port = None
+        for p in s.get("ports") or []:
+            if p.get("name") == active:
+                port = p
+        if card and active:
+            live_ports.add((card, active))
+        # (A card's other ports: "Speakers" / "Headphones" on the same sink are fine as they are.)
+        print("SINK", s.get("name", ""), "1" if s.get("name") == default else "0",
+              label_for(s.get("description", s.get("name", "")), port), sep="\t")
+    for c in cards:
+        cname = c.get("name", "")
+        profiles = c.get("profiles") or {}
+        active = c.get("active_profile", "")
+        ports = c.get("ports") or {}
+        for pname, port in ports.items():
+            if port.get("availability") == "not available":
+                continue
+            outs = [p for p in port.get("profiles") or [] if p.startswith("output:")]
+            if not outs or (cname, pname) in live_ports:
+                continue
+            if active in (port.get("profiles") or []):
+                continue   # the card's on it already (its sink is listed)
+            # The best profile for it: available, highest priority; output-only
+            # ones before ones that also take the microphone.
+            def score(p):
+                info = profiles.get(p) or {}
+                return (info.get("available", True) is not False, "+input" not in p, info.get("priority", 0))
+            best = max(outs, key=score)
+            if (profiles.get(best) or {}).get("available") is False:
+                continue
+            print("PORT", cname, best, label_for(c.get("properties", {}).get("device.description", ""), port), sep="\t")
+
+
+def use_port(card, profile):
+    run("pactl", "set-card-profile", card, profile)
+    # Its sink appears a moment later.
+    for _ in range(20):
+        time.sleep(0.15)
+        for s in pj("list", "sinks"):
+            props = s.get("properties") or {}
+            if props.get("device.name") == card:
+                use_sink(s.get("name"))
+                return
+
+
+if len(sys.argv) >= 3 and sys.argv[1] == "--sink":
+    use_sink(sys.argv[2])
+elif len(sys.argv) >= 4 and sys.argv[1] == "--port":
+    use_port(sys.argv[2], sys.argv[3])
+else:
+    listing()
