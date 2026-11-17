@@ -173,10 +173,3 @@ its tile or slider:
 | `src/protocols.cpp` | xdg-activation, pointer lock for games, shortcut inhibit |
 
 Colours and fonts live in `theme` in `src/draw.hpp` (`set_theme`).
-
-## Not done yet (next steps)
-
-- Layer-shell (lets external panels, docks and lock screens run on Dusk;
-  needed for picking a screenshot area with slurp)
-- A lock screen (and locking when idle)
-- Screen sharing to apps (xdg-desktop-portal screencast)
